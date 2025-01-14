@@ -1,17 +1,33 @@
 /*
- * Copyright (c) 2019-2022, NVIDIA CORPORATION.  All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
+ * The HAMi Contributors require contributions made to
+ * this file be licensed under the Apache-2.0 license or a
+ * compatible open source license.
+ */
+
+/*
+ * Licensed to NVIDIA CORPORATION under one or more contributor
+ * license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright
+ * ownership. NVIDIA CORPORATION licenses this file to you under
+ * the Apache License, Version 2.0 (the "License"); you may
+ * not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY Type, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
+/*
+ * Modifications Copyright The HAMi Authors. See
+ * GitHub history for details.
  */
 
 package rm
@@ -260,23 +276,23 @@ func (r *nvmlResourceManager) getMigDeviceParts(d *Device) (string, int, int, er
 func parseMigDeviceUUID(mig string) (string, int, int, error) {
 	tokens := strings.SplitN(mig, "-", 2)
 	if len(tokens) != 2 || tokens[0] != "MIG" {
-		return "", 0, 0, fmt.Errorf("Unable to parse UUID as MIG device")
+		return "", 0, 0, fmt.Errorf("unable to parse UUID as MIG device")
 	}
 
 	tokens = strings.SplitN(tokens[1], "/", 3)
 	if len(tokens) != 3 || !strings.HasPrefix(tokens[0], "GPU-") {
-		return "", 0, 0, fmt.Errorf("Unable to parse UUID as MIG device")
+		return "", 0, 0, fmt.Errorf("unable to parse UUID as MIG device")
 	}
 
-	gi, err := strconv.Atoi(tokens[1])
+	gi, err := strconv.ParseInt(tokens[1], 10, 32)
 	if err != nil {
-		return "", 0, 0, fmt.Errorf("Unable to parse UUID as MIG device")
+		return "", 0, 0, fmt.Errorf("unable to parse UUID as MIG device")
 	}
 
-	ci, err := strconv.Atoi(tokens[2])
+	ci, err := strconv.ParseInt(tokens[2], 10, 32)
 	if err != nil {
-		return "", 0, 0, fmt.Errorf("Unable to parse UUID as MIG device")
+		return "", 0, 0, fmt.Errorf("unable to parse UUID as MIG device")
 	}
 
-	return tokens[0], gi, ci, nil
+	return tokens[0], int(gi), int(ci), nil
 }

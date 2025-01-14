@@ -1,26 +1,28 @@
 /*
- * Copyright © 2021 peizhaoyou <peizhaoyou@4paradigm.com>
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
+Copyright 2024 The HAMi Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
 
 package scheduler
 
 import (
 	"sync"
 
-	"4pd.io/k8s-vgpu/pkg/util"
+	"github.com/Project-HAMi/HAMi/pkg/util"
+
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	k8stypes "k8s.io/apimachinery/pkg/types"
 	"k8s.io/klog/v2"
 )
@@ -28,10 +30,18 @@ import (
 type podInfo struct {
 	Namespace string
 	Name      string
-	Uid       k8stypes.UID
+	UID       k8stypes.UID
 	NodeID    string
 	Devices   util.PodDevices
 	CtrIDs    []string
+}
+
+// PodUseDeviceStat count pod use device info.
+type PodUseDeviceStat struct {
+	// count current node all running success pod num
+	TotalPod int
+	// only running success pod and use device pod can count.
+	UseDevicePod int
 }
 
 type podManager struct {
@@ -48,9 +58,11 @@ func (m *podManager) addPod(pod *corev1.Pod, nodeID string, devices util.PodDevi
 	defer m.mutex.Unlock()
 	_, ok := m.pods[pod.UID]
 	if !ok {
-		pi := &podInfo{Name: pod.Name, Uid: pod.UID, Namespace: pod.Namespace, NodeID: nodeID, Devices: devices}
+		pi := &podInfo{Name: pod.Name, UID: pod.UID, Namespace: pod.Namespace, NodeID: nodeID, Devices: devices}
 		m.pods[pod.UID] = pi
-		klog.Infof("Pod added: Name: %s, Uid: %s, Namespace: %s, NodeID: %s", pod.Name, pod.UID, pod.Namespace, nodeID)
+		klog.Infof("Pod added: Name: %s, UID: %s, Namespace: %s, NodeID: %s", pod.Name, pod.UID, pod.Namespace, nodeID)
+	} else {
+		m.pods[pod.UID].Devices = devices
 	}
 }
 
@@ -62,6 +74,31 @@ func (m *podManager) delPod(pod *corev1.Pod) {
 		klog.Infof("Deleted pod %s with node ID %s", pi.Name, pi.NodeID)
 		delete(m.pods, pod.UID)
 	}
+}
+
+func (m *podManager) ListPodsUID() ([]*corev1.Pod, error) {
+	m.mutex.RLock()
+	defer m.mutex.RUnlock()
+	pods := make([]*corev1.Pod, 0)
+	for uid := range m.pods {
+		pods = append(pods, &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				UID: uid,
+			},
+		})
+	}
+	return pods, nil
+}
+
+func (m *podManager) ListPodsInfo() []*podInfo {
+	m.mutex.RLock()
+	defer m.mutex.RUnlock()
+	pods := make([]*podInfo, 0)
+	for key := range m.pods {
+		values := m.pods[key]
+		pods = append(pods, values)
+	}
+	return pods
 }
 
 func (m *podManager) GetScheduledPods() (map[k8stypes.UID]*podInfo, error) {
