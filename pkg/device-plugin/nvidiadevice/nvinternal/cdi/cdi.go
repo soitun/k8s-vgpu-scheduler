@@ -1,17 +1,33 @@
 /*
- * Copyright (c) 2023, NVIDIA CORPORATION.  All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
+ * The HAMi Contributors require contributions made to
+ * this file be licensed under the Apache-2.0 license or a
+ * compatible open source license.
+ */
+
+/*
+ * Licensed to NVIDIA CORPORATION under one or more contributor
+ * license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright
+ * ownership. NVIDIA CORPORATION licenses this file to you under
+ * the Apache License, Version 2.0 (the "License"); you may
+ * not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
+/*
+ * Modifications Copyright The HAMi Authors. See
+ * GitHub history for details.
  */
 
 package cdi
@@ -23,7 +39,7 @@ import (
 	nvdevice "github.com/NVIDIA/go-nvlib/pkg/nvlib/device"
 	"github.com/NVIDIA/go-nvlib/pkg/nvml"
 	"github.com/NVIDIA/nvidia-container-toolkit/pkg/nvcdi"
-	"github.com/NVIDIA/nvidia-container-toolkit/pkg/nvcdi/transform"
+	roottransform "github.com/NVIDIA/nvidia-container-toolkit/pkg/nvcdi/transform/root"
 	"github.com/sirupsen/logrus"
 	cdiapi "tags.cncf.io/container-device-interface/pkg/cdi"
 )
@@ -32,7 +48,7 @@ const (
 	cdiRoot = "/var/run/cdi"
 )
 
-// cdiHandler creates CDI specs for devices assocatied with the device plugin
+// cdiHandler creates CDI specs for devices assocatied with the device plugin.
 type cdiHandler struct {
 	logger           *logrus.Logger
 	nvml             nvml.Interface
@@ -53,7 +69,7 @@ type cdiHandler struct {
 
 var _ Interface = &cdiHandler{}
 
-// newHandler constructs a new instance of the 'cdi' interface
+// newHandler constructs a new instance of the 'cdi' interface.
 func newHandler(opts ...Option) (Interface, error) {
 	c := &cdiHandler{}
 	for _, opt := range opts {
@@ -96,7 +112,7 @@ func newHandler(opts ...Option) (Interface, error) {
 		nvcdi.WithDeviceLib(c.nvdevice),
 		nvcdi.WithNVIDIACTKPath(c.nvidiaCTKPath),
 		nvcdi.WithDriverRoot(c.driverRoot),
-		nvcdi.WithDeviceNamer(deviceNamer),
+		nvcdi.WithDeviceNamers(deviceNamer),
 		nvcdi.WithVendor(c.vendor),
 		nvcdi.WithClass("gpu"),
 	)
@@ -147,7 +163,10 @@ func (cdi *cdiHandler) CreateSpecFile() error {
 			return fmt.Errorf("failed to get CDI spec: %v", err)
 		}
 
-		err = transform.NewRootTransformer(cdi.driverRoot, cdi.targetDriverRoot).Transform(spec.Raw())
+		err = roottransform.New(
+			roottransform.WithRoot(cdi.driverRoot),
+			roottransform.WithTargetRoot(cdi.targetDriverRoot),
+		).Transform(spec.Raw())
 		if err != nil {
 			return fmt.Errorf("failed to transform driver root in CDI spec: %v", err)
 		}
