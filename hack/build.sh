@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# Copyright © 2021 peizhaoyou <peizhaoyou@4paradigm.com>
+# Copyright © 2024 HAMi Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -22,7 +22,7 @@ export SHORT_VERSION
 export COMMIT_CODE
 export VERSION="${SHORT_VERSION}-${COMMIT_CODE}"
 export LATEST_VERSION="latest"
-export GOLANG_IMAGE="golang:1.21-bullseye"
+export GOLANG_IMAGE="golang:1.22.5-bullseye"
 export NVIDIA_IMAGE="nvidia/cuda:12.2.0-devel-ubuntu20.04"
 export DEST_DIR="/usr/local"
 

@@ -1,41 +1,45 @@
 /*
- * Copyright © 2021 peizhaoyou <peizhaoyou@4paradigm.com>
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
+Copyright 2024 The HAMi Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
 
 package scheduler
 
 import (
 	"context"
+	"fmt"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
 
-	"4pd.io/k8s-vgpu/pkg/device"
-	"4pd.io/k8s-vgpu/pkg/k8sutil"
-	"4pd.io/k8s-vgpu/pkg/util"
-	"4pd.io/k8s-vgpu/pkg/util/nodelock"
-	v1 "k8s.io/api/core/v1"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	listerscorev1 "k8s.io/client-go/listers/core/v1"
 	"k8s.io/client-go/tools/cache"
+	"k8s.io/client-go/tools/record"
 	"k8s.io/klog/v2"
 	extenderv1 "k8s.io/kube-scheduler/extender/v1"
+
+	"github.com/Project-HAMi/HAMi/pkg/device"
+	"github.com/Project-HAMi/HAMi/pkg/k8sutil"
+	"github.com/Project-HAMi/HAMi/pkg/scheduler/config"
+	"github.com/Project-HAMi/HAMi/pkg/scheduler/policy"
+	"github.com/Project-HAMi/HAMi/pkg/util"
 )
 
 type Scheduler struct {
@@ -48,18 +52,23 @@ type Scheduler struct {
 	nodeLister listerscorev1.NodeLister
 	//Node status returned by filter
 	cachedstatus map[string]*NodeUsage
+	nodeNotify   chan struct{}
 	//Node Overview
 	overviewstatus map[string]*NodeUsage
+
+	eventRecorder record.EventRecorder
 }
 
 func NewScheduler() *Scheduler {
-	klog.Infof("New Scheduler")
+	klog.InfoS("Initializing HAMi scheduler")
 	s := &Scheduler{
 		stopCh:       make(chan struct{}),
 		cachedstatus: make(map[string]*NodeUsage),
+		nodeNotify:   make(chan struct{}, 1),
 	}
 	s.nodeManager.init()
 	s.podManager.init()
+	klog.V(2).InfoS("Scheduler initialized successfully")
 	return s
 }
 
@@ -69,17 +78,26 @@ func check(err error) {
 	}
 }
 
+func (s *Scheduler) onUpdateNode(_, newObj interface{}) {
+	s.nodeNotify <- struct{}{}
+}
+
+func (s *Scheduler) onDelNode(obj interface{}) {
+	s.nodeNotify <- struct{}{}
+}
+
+func (s *Scheduler) onAddNode(obj interface{}) {
+	s.nodeNotify <- struct{}{}
+}
+
 func (s *Scheduler) onAddPod(obj interface{}) {
-	pod, ok := obj.(*v1.Pod)
+	pod, ok := obj.(*corev1.Pod)
 	if !ok {
-		klog.Errorf("unknown add object type")
+		klog.ErrorS(fmt.Errorf("invalid pod object"), "Failed to process pod addition")
 		return
 	}
+	klog.V(5).InfoS("Pod added", "pod", pod.Name, "namespace", pod.Namespace)
 	nodeID, ok := pod.Annotations[util.AssignedNodeAnnotations]
-	if !ok {
-		return
-	}
-	ids, ok := pod.Annotations[util.AssignedIDsAnnotations]
 	if !ok {
 		return
 	}
@@ -87,7 +105,7 @@ func (s *Scheduler) onAddPod(obj interface{}) {
 		s.delPod(pod)
 		return
 	}
-	podDev, _ := util.DecodePodDevices(ids)
+	podDev, _ := util.DecodePodDevices(util.SupportDevices, pod.Annotations)
 	s.addPod(pod, nodeID, podDev)
 }
 
@@ -96,7 +114,7 @@ func (s *Scheduler) onUpdatePod(_, newObj interface{}) {
 }
 
 func (s *Scheduler) onDelPod(obj interface{}) {
-	pod, ok := obj.(*v1.Pod)
+	pod, ok := obj.(*corev1.Pod)
 	if !ok {
 		klog.Errorf("unknown add object type")
 		return
@@ -109,6 +127,7 @@ func (s *Scheduler) onDelPod(obj interface{}) {
 }
 
 func (s *Scheduler) Start() {
+	klog.InfoS("Starting HAMi scheduler components")
 	kubeClient, err := k8sutil.NewClient()
 	check(err)
 	s.kubeClient = kubeClient
@@ -122,132 +141,130 @@ func (s *Scheduler) Start() {
 		UpdateFunc: s.onUpdatePod,
 		DeleteFunc: s.onDelPod,
 	})
-
+	informerFactory.Core().V1().Nodes().Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc:    s.onAddNode,
+		UpdateFunc: s.onUpdateNode,
+		DeleteFunc: s.onDelNode,
+	})
 	informerFactory.Start(s.stopCh)
 	informerFactory.WaitForCacheSync(s.stopCh)
-
+	s.addAllEventHandlers()
 }
 
 func (s *Scheduler) Stop() {
 	close(s.stopCh)
 }
 
-func (s *Scheduler) RegisterFromNodeAnnotatons() error {
-	klog.V(5).Infoln("Scheduler into RegisterFromNodeAnnotations")
-	nodeInfoCopy := make(map[string]*NodeInfo)
+func (s *Scheduler) RegisterFromNodeAnnotations() {
+	klog.InfoS("Entering RegisterFromNodeAnnotations")
+	defer klog.InfoS("Exiting RegisterFromNodeAnnotations")
+	ticker := time.NewTicker(time.Second * 15)
+	defer ticker.Stop()
+	printedLog := map[string]bool{}
 	for {
-		nodes, err := s.nodeLister.List(labels.Everything())
-		if err != nil {
-			klog.Errorln("nodes list failed", err.Error())
-			return err
+		select {
+		case <-s.nodeNotify:
+			klog.V(5).InfoS("Received node notification")
+		case <-ticker.C:
+			klog.InfoS("Ticker triggered")
+		case <-s.stopCh:
+			klog.InfoS("Received stop signal, exiting RegisterFromNodeAnnotations")
+			return
 		}
-		nodeNames := []string{}
-		for _, val := range nodes {
+		labelSelector := labels.Everything()
+		if len(config.NodeLabelSelector) > 0 {
+			labelSelector = (labels.Set)(config.NodeLabelSelector).AsSelector()
+			klog.InfoS("Using label selector", "selector", labelSelector.String())
+		}
+		rawNodes, err := s.nodeLister.List(labelSelector)
+		if err != nil {
+			klog.ErrorS(err, "Failed to list nodes with selector", "selector", labelSelector.String())
+			continue
+		}
+		klog.V(5).InfoS("Listed nodes", "nodeCount", len(rawNodes))
+		var nodeNames []string
+		for _, val := range rawNodes {
 			nodeNames = append(nodeNames, val.Name)
-			for devhandsk, devreg := range device.KnownDevice {
-				_, ok := val.Annotations[devreg]
-				if !ok {
-					continue
-				}
-				nodedevices, err := util.DecodeNodeDevices(val.Annotations[devreg])
-				if err != nil {
-					klog.ErrorS(err, "failed to decode node devices", "node", val.Name, "device annotation", val.Annotations[devreg])
-					continue
-				}
-				if len(nodedevices) == 0 {
-					klog.InfoS("no node gpu device found", "node", val.Name, "device annotation", val.Annotations[devreg])
-					continue
-				}
-				klog.V(5).InfoS("nodes device information", "node", val.Name, "nodedevices", util.EncodeNodeDevices(nodedevices))
-				handshake := val.Annotations[devhandsk]
-				if strings.Contains(handshake, "Requesting") {
-					formertime, _ := time.Parse("2006.01.02 15:04:05", strings.Split(handshake, "_")[1])
-					if time.Now().After(formertime.Add(time.Second * 60)) {
-						_, ok := s.nodes[val.Name]
-						if ok {
-							_, ok = nodeInfoCopy[devhandsk]
-							if ok && nodeInfoCopy[devhandsk] != nil {
-								s.rmNodeDevice(val.Name, nodeInfoCopy[devhandsk])
-								klog.Infof("node %v device %s:%v leave, %v remaining devices:%v", val.Name, devhandsk, nodeInfoCopy[devhandsk], err, s.nodes[val.Name].Devices)
+			klog.V(5).InfoS("Processing node", "nodeName", val.Name)
 
-								tmppat := make(map[string]string)
-								tmppat[devhandsk] = "Deleted_" + time.Now().Format("2006.01.02 15:04:05")
-								n, err := util.GetNode(val.Name)
-								if err != nil {
-									klog.Errorln("get node failed", err.Error())
-									continue
-								}
-								util.PatchNodeAnnotations(n, tmppat)
-								continue
-							}
-						}
+			for devhandsk, devInstance := range device.GetDevices() {
+				klog.V(5).InfoS("Checking device health", "nodeName", val.Name, "deviceVendor", devhandsk)
+
+				health, needUpdate := devInstance.CheckHealth(devhandsk, val)
+				klog.V(5).InfoS("Device health check result", "nodeName", val.Name, "deviceVendor", devhandsk, "health", health, "needUpdate", needUpdate)
+
+				if !health {
+					klog.Warning("Device is unhealthy, cleaning up node", "nodeName", val.Name, "deviceVendor", devhandsk)
+					err := devInstance.NodeCleanUp(val.Name)
+					if err != nil {
+						klog.ErrorS(err, "Node cleanup failed", "nodeName", val.Name, "deviceVendor", devhandsk)
+					}
+
+					info, ok := s.nodes[val.Name]
+					if ok {
+						klog.InfoS("Removing device from node", "nodeName", val.Name, "deviceVendor", devhandsk, "remainingDevices", s.nodes[val.Name].Devices)
+						s.rmNodeDevice(val.Name, info, devhandsk)
 					}
 					continue
-				} else if strings.Contains(handshake, "Deleted") {
+				}
+				if !needUpdate {
+					klog.V(5).InfoS("No update needed for device", "nodeName", val.Name, "deviceVendor", devhandsk)
 					continue
-				} else {
+				}
+				_, ok := util.HandshakeAnnos[devhandsk]
+				if ok {
 					tmppat := make(map[string]string)
-					tmppat[devhandsk] = "Requesting_" + time.Now().Format("2006.01.02 15:04:05")
+					tmppat[util.HandshakeAnnos[devhandsk]] = "Requesting_" + time.Now().Format(time.DateTime)
+					klog.InfoS("New timestamp for annotation", "nodeName", val.Name, "annotationKey", util.HandshakeAnnos[devhandsk], "annotationValue", tmppat[util.HandshakeAnnos[devhandsk]])
 					n, err := util.GetNode(val.Name)
 					if err != nil {
-						klog.Errorln("get node failed", err.Error())
+						klog.ErrorS(err, "Failed to get node", "nodeName", val.Name)
 						continue
 					}
-					util.PatchNodeAnnotations(n, tmppat)
+					klog.V(5).InfoS("Patching node annotations", "nodeName", val.Name, "annotations", tmppat)
+					if err := util.PatchNodeAnnotations(n, tmppat); err != nil {
+						klog.ErrorS(err, "Failed to patch node annotations", "nodeName", val.Name)
+					}
 				}
-				nodeInfo := &NodeInfo{}
+				nodeInfo := &util.NodeInfo{}
 				nodeInfo.ID = val.Name
-				nodeInfo.Devices = make([]DeviceInfo, 0)
-				for index, deviceinfo := range nodedevices {
-					found := false
-					_, ok := s.nodes[val.Name]
-					if ok {
-						for i1, val1 := range s.nodes[val.Name].Devices {
-							if strings.Compare(val1.ID, deviceinfo.Id) == 0 {
-								found = true
-								s.nodes[val.Name].Devices[i1].Devmem = deviceinfo.Devmem
-								s.nodes[val.Name].Devices[i1].Devcore = deviceinfo.Devcore
-								break
-							}
-						}
-					}
-					if !found {
-						nodeInfo.Devices = append(nodeInfo.Devices, DeviceInfo{
-							ID:      deviceinfo.Id,
-							Index:   uint(index),
-							Count:   deviceinfo.Count,
-							Devmem:  deviceinfo.Devmem,
-							Devcore: deviceinfo.Devcore,
-							Type:    deviceinfo.Type,
-							Numa:    deviceinfo.Numa,
-							Health:  deviceinfo.Health,
-						})
-					}
+				nodeInfo.Node = val
+				klog.V(5).InfoS("Fetching node devices", "nodeName", val.Name, "deviceVendor", devhandsk)
+				nodedevices, err := devInstance.GetNodeDevices(*val)
+				if err != nil {
+					klog.ErrorS(err, "Failed to get node devices", "nodeName", val.Name, "deviceVendor", devhandsk)
+					continue
+				}
+				nodeInfo.Devices = make([]util.DeviceInfo, 0)
+				for _, deviceinfo := range nodedevices {
+					nodeInfo.Devices = append(nodeInfo.Devices, *deviceinfo)
 				}
 				s.addNode(val.Name, nodeInfo)
-				nodeInfoCopy[devhandsk] = nodeInfo
-				if s.nodes[val.Name] != nil && nodeInfo != nil && len(nodeInfo.Devices) > 0 {
-					klog.Infof("node %v device %s come node info=%v total=%v", val.Name, devhandsk, nodeInfoCopy[devhandsk], s.nodes[val.Name].Devices)
+				if s.nodes[val.Name] != nil && len(nodeInfo.Devices) > 0 {
+					if printedLog[val.Name] {
+						klog.V(5).InfoS("Node device updated", "nodeName", val.Name, "deviceVendor", devhandsk, "nodeInfo", nodeInfo, "totalDevices", s.nodes[val.Name].Devices)
+					} else {
+						klog.InfoS("Node device added", "nodeName", val.Name, "deviceVendor", devhandsk, "nodeInfo", nodeInfo, "totalDevices", s.nodes[val.Name].Devices)
+						printedLog[val.Name] = true
+					}
 				}
 			}
 		}
 		_, _, err = s.getNodesUsage(&nodeNames, nil)
 		if err != nil {
-			klog.Errorln("get node usage failed", err.Error())
-			return err
+			klog.ErrorS(err, "Failed to get node usage", "nodeNames", nodeNames)
 		}
-		time.Sleep(time.Second * 15)
 	}
 }
 
-// InspectAllNodesUsage is used by metrics monitor
+// InspectAllNodesUsage is used by metrics monitor.
 func (s *Scheduler) InspectAllNodesUsage() *map[string]*NodeUsage {
 	return &s.overviewstatus
 }
 
 // returns all nodes and its device memory usage, and we filter it with nodeSelector, taints, nodeAffinity
-// unschedulerable and nodeName
-func (s *Scheduler) getNodesUsage(nodes *[]string, task *v1.Pod) (*map[string]*NodeUsage, map[string]string, error) {
+// unschedulerable and nodeName.
+func (s *Scheduler) getNodesUsage(nodes *[]string, task *corev1.Pod) (*map[string]*NodeUsage, map[string]string, error) {
 	overallnodeMap := make(map[string]*NodeUsage)
 	cachenodeMap := make(map[string]*NodeUsage)
 	failedNodes := make(map[string]string)
@@ -259,37 +276,76 @@ func (s *Scheduler) getNodesUsage(nodes *[]string, task *v1.Pod) (*map[string]*N
 
 	for _, node := range allNodes {
 		nodeInfo := &NodeUsage{}
+		userGPUPolicy := config.GPUSchedulerPolicy
+		if task != nil && task.Annotations != nil {
+			if value, ok := task.Annotations[policy.GPUSchedulerPolicyAnnotationKey]; ok {
+				userGPUPolicy = value
+			}
+		}
+		nodeInfo.Node = node.Node
+		nodeInfo.Devices = policy.DeviceUsageList{
+			Policy:      userGPUPolicy,
+			DeviceLists: make([]*policy.DeviceListsScore, 0),
+		}
 		for _, d := range node.Devices {
-			nodeInfo.Devices = append(nodeInfo.Devices, &util.DeviceUsage{
-				Id:        d.ID,
-				Index:     d.Index,
-				Used:      0,
-				Count:     d.Count,
-				Usedmem:   0,
-				Totalmem:  d.Devmem,
-				Totalcore: d.Devcore,
-				Usedcores: 0,
-				Type:      d.Type,
-				Numa:      d.Numa,
-				Health:    d.Health,
+			nodeInfo.Devices.DeviceLists = append(nodeInfo.Devices.DeviceLists, &policy.DeviceListsScore{
+				Score: 0,
+				Device: &util.DeviceUsage{
+					ID:        d.ID,
+					Index:     d.Index,
+					Used:      0,
+					Count:     d.Count,
+					Usedmem:   0,
+					Totalmem:  d.Devmem,
+					Totalcore: d.Devcore,
+					Usedcores: 0,
+					MigUsage: util.MigInUse{
+						Index:     0,
+						UsageList: make(util.MIGS, 0),
+					},
+					MigTemplate: d.MIGTemplate,
+					Mode:        d.Mode,
+					Type:        d.Type,
+					Numa:        d.Numa,
+					Health:      d.Health,
+				},
 			})
 		}
 		overallnodeMap[node.ID] = nodeInfo
-
 	}
-	//}
-	for _, p := range s.pods {
+
+	podsInfo := s.ListPodsInfo()
+	for _, p := range podsInfo {
 		node, ok := overallnodeMap[p.NodeID]
 		if !ok {
 			continue
 		}
-		for _, ds := range p.Devices {
-			for _, udevice := range ds {
-				for _, d := range node.Devices {
-					if d.Id == udevice.UUID {
-						d.Used++
-						d.Usedmem += udevice.Usedmem
-						d.Usedcores += udevice.Usedcores
+		for _, podsingleds := range p.Devices {
+			for _, ctrdevs := range podsingleds {
+				for _, udevice := range ctrdevs {
+					for _, d := range node.Devices.DeviceLists {
+						deviceID := udevice.UUID
+						if strings.Contains(deviceID, "[") {
+							deviceID = strings.Split(deviceID, "[")[0]
+						}
+						if d.Device.ID == deviceID {
+							d.Device.Used++
+							d.Device.Usedmem += udevice.Usedmem
+							d.Device.Usedcores += udevice.Usedcores
+							if strings.Contains(udevice.UUID, "[") {
+								if strings.Compare(d.Device.Mode, "hami-core") == 0 {
+									klog.Errorf("found a mig task running on a hami-core GPU\n")
+									d.Device.Health = false
+									continue
+								}
+								tmpIdx, Instance, _ := util.ExtractMigTemplatesFromUUID(udevice.UUID)
+								if len(d.Device.MigUsage.UsageList) == 0 {
+									util.PlatternMIG(&d.Device.MigUsage, d.Device.MigTemplate, tmpIdx)
+								}
+								d.Device.MigUsage.UsageList[Instance].InUse = true
+								klog.V(5).Infoln("add mig usage", d.Device.MigUsage, "template=", d.Device.MigTemplate, "uuid=", d.Device.ID)
+							}
+						}
 					}
 				}
 			}
@@ -300,8 +356,9 @@ func (s *Scheduler) getNodesUsage(nodes *[]string, task *v1.Pod) (*map[string]*N
 	for _, nodeID := range *nodes {
 		node, err := s.GetNode(nodeID)
 		if err != nil {
-			klog.Errorf("get node %v device error, %v", nodeID, err)
-			failedNodes[nodeID] = "node unregisterd"
+			// The identified node does not have a gpu device, so the log here has no practical meaning,increase log priority.
+			klog.V(5).InfoS("node unregistered", "node", nodeID, "error", err)
+			failedNodes[nodeID] = "node unregistered"
 			continue
 		}
 		cachenodeMap[node.ID] = overallnodeMap[node.ID]
@@ -310,50 +367,99 @@ func (s *Scheduler) getNodesUsage(nodes *[]string, task *v1.Pod) (*map[string]*N
 	return &cachenodeMap, failedNodes, nil
 }
 
+func (s *Scheduler) getPodUsage() (map[string]PodUseDeviceStat, error) {
+	podUsageStat := make(map[string]PodUseDeviceStat)
+	pods, err := s.podLister.List(labels.NewSelector())
+	if err != nil {
+		return nil, err
+	}
+	for _, pod := range pods {
+		if pod.Status.Phase != corev1.PodSucceeded {
+			continue
+		}
+		podUseDeviceNum := 0
+		if v, ok := pod.Annotations[util.DeviceBindPhase]; ok && v == util.DeviceBindSuccess {
+			podUseDeviceNum = 1
+		}
+		nodeName := pod.Spec.NodeName
+		if _, ok := podUsageStat[nodeName]; !ok {
+			podUsageStat[nodeName] = PodUseDeviceStat{
+				TotalPod:     1,
+				UseDevicePod: podUseDeviceNum,
+			}
+		} else {
+			exist := podUsageStat[nodeName]
+			podUsageStat[nodeName] = PodUseDeviceStat{
+				TotalPod:     exist.TotalPod + 1,
+				UseDevicePod: exist.UseDevicePod + podUseDeviceNum,
+			}
+		}
+	}
+	return podUsageStat, nil
+}
+
 func (s *Scheduler) Bind(args extenderv1.ExtenderBindingArgs) (*extenderv1.ExtenderBindingResult, error) {
-	klog.InfoS("Bind", "pod", args.PodName, "namespace", args.PodNamespace, "podUID", args.PodUID, "node", args.Node)
-	var err error
+	klog.InfoS("Attempting to bind pod to node", "pod", args.PodName, "namespace", args.PodNamespace, "node", args.Node)
 	var res *extenderv1.ExtenderBindingResult
-	binding := &v1.Binding{
+
+	binding := &corev1.Binding{
 		ObjectMeta: metav1.ObjectMeta{Name: args.PodName, UID: args.PodUID},
-		Target:     v1.ObjectReference{Kind: "Node", Name: args.Node},
+		Target:     corev1.ObjectReference{Kind: "Node", Name: args.Node},
 	}
 	current, err := s.kubeClient.CoreV1().Pods(args.PodNamespace).Get(context.Background(), args.PodName, metav1.GetOptions{})
 	if err != nil {
-		klog.ErrorS(err, "Get pod failed")
+		klog.ErrorS(err, "Failed to get pod", "pod", args.PodName, "namespace", args.PodNamespace)
+		return &extenderv1.ExtenderBindingResult{Error: err.Error()}, err
 	}
-	err = nodelock.LockNode(args.Node)
+	klog.InfoS("Trying to get the target node for pod", "pod", args.PodName, "namespace", args.PodNamespace, "node", args.Node)
+	node, err := s.kubeClient.CoreV1().Nodes().Get(context.Background(), args.Node, metav1.GetOptions{})
 	if err != nil {
-		klog.ErrorS(err, "Failed to lock node", "node", args.Node)
+		klog.ErrorS(err, "Failed to get node", "node", args.Node)
+		s.recordScheduleBindingResultEvent(current, EventReasonBindingFailed, []string{}, fmt.Errorf("failed to get node %s", args.Node))
+		res = &extenderv1.ExtenderBindingResult{Error: err.Error()}
+		return res, nil
 	}
-	//defer util.ReleaseNodeLock(args.Node)
 
-	tmppatch := make(map[string]string)
-	tmppatch[util.DeviceBindPhase] = "allocating"
-	tmppatch[util.BindTimeAnnotations] = strconv.FormatInt(time.Now().Unix(), 10)
+	tmppatch := map[string]string{
+		util.DeviceBindPhase:     "allocating",
+		util.BindTimeAnnotations: strconv.FormatInt(time.Now().Unix(), 10),
+	}
+
+	for _, val := range device.GetDevices() {
+		err = val.LockNode(node, current)
+		if err != nil {
+			klog.ErrorS(err, "Failed to lock node", "node", args.Node, "device", val)
+			goto ReleaseNodeLocks
+		}
+	}
 
 	err = util.PatchPodAnnotations(current, tmppatch)
 	if err != nil {
-		klog.ErrorS(err, "patch pod annotation failed")
+		klog.ErrorS(err, "Failed to patch pod annotations", "pod", klog.KObj(current))
+		return &extenderv1.ExtenderBindingResult{Error: err.Error()}, err
 	}
-	if err = s.kubeClient.CoreV1().Pods(args.PodNamespace).Bind(context.Background(), binding, metav1.CreateOptions{}); err != nil {
-		klog.ErrorS(err, "Failed to bind pod", "pod", args.PodName, "namespace", args.PodNamespace, "podUID", args.PodUID, "node", args.Node)
+
+	err = s.kubeClient.CoreV1().Pods(args.PodNamespace).Bind(context.Background(), binding, metav1.CreateOptions{})
+	if err != nil {
+		klog.ErrorS(err, "Failed to bind pod", "pod", args.PodName, "namespace", args.PodNamespace, "node", args.Node)
+		goto ReleaseNodeLocks
 	}
-	if err == nil {
-		res = &extenderv1.ExtenderBindingResult{
-			Error: "",
-		}
-	} else {
-		res = &extenderv1.ExtenderBindingResult{
-			Error: err.Error(),
-		}
+
+	s.recordScheduleBindingResultEvent(current, EventReasonBindingSucceed, []string{args.Node}, nil)
+	klog.InfoS("Successfully bound pod to node", "pod", args.PodName, "namespace", args.PodNamespace, "node", args.Node)
+	return &extenderv1.ExtenderBindingResult{Error: ""}, nil
+
+ReleaseNodeLocks:
+	klog.InfoS("Release node locks", "node", args.Node)
+	for _, val := range device.GetDevices() {
+		val.ReleaseNodeLock(node, current)
 	}
-	klog.Infoln("After Binding Process")
-	return res, nil
+	s.recordScheduleBindingResultEvent(current, EventReasonBindingFailed, []string{}, err)
+	return &extenderv1.ExtenderBindingResult{Error: err.Error()}, nil
 }
 
 func (s *Scheduler) Filter(args extenderv1.ExtenderArgs) (*extenderv1.ExtenderFilterResult, error) {
-	klog.InfoS("begin schedule filter", "pod", args.Pod.Name, "uuid", args.Pod.UID, "namespaces", args.Pod.Namespace)
+	klog.InfoS("Starting schedule filter process", "pod", args.Pod.Name, "uuid", args.Pod.UID, "namespace", args.Pod.Namespace)
 	nums := k8sutil.Resourcereqs(args.Pod)
 	total := 0
 	for _, n := range nums {
@@ -362,7 +468,9 @@ func (s *Scheduler) Filter(args extenderv1.ExtenderArgs) (*extenderv1.ExtenderFi
 		}
 	}
 	if total == 0 {
-		klog.V(1).Infof("pod %v not find resource", args.Pod.Name)
+		klog.V(1).InfoS("Pod does not request any resources",
+			"pod", args.Pod.Name)
+		s.recordScheduleFilterResultEvent(args.Pod, EventReasonFilteringFailed, []string{}, fmt.Errorf("does not request any resource"))
 		return &extenderv1.ExtenderFilterResult{
 			NodeNames:   args.NodeNames,
 			FailedNodes: nil,
@@ -373,34 +481,55 @@ func (s *Scheduler) Filter(args extenderv1.ExtenderArgs) (*extenderv1.ExtenderFi
 	s.delPod(args.Pod)
 	nodeUsage, failedNodes, err := s.getNodesUsage(args.NodeNames, args.Pod)
 	if err != nil {
+		s.recordScheduleFilterResultEvent(args.Pod, EventReasonFilteringFailed, []string{}, err)
 		return nil, err
 	}
 	if len(failedNodes) != 0 {
-		klog.V(5).InfoS("getNodesUsage failed nodes", "nodes", failedNodes)
+		klog.V(5).InfoS("Nodes failed during usage retrieval",
+			"nodes", failedNodes)
 	}
-	nodeScores, err := calcScore(nodeUsage, &failedNodes, nums, annos, args.Pod)
+	nodeScores, err := s.calcScore(nodeUsage, nums, annos, args.Pod, failedNodes)
 	if err != nil {
+		err := fmt.Errorf("calcScore failed %v for pod %v", err, args.Pod.Name)
+		s.recordScheduleFilterResultEvent(args.Pod, EventReasonFilteringFailed, []string{}, err)
 		return nil, err
 	}
-	if len(*nodeScores) == 0 {
+	if len((*nodeScores).NodeList) == 0 {
+		klog.V(4).InfoS("No available nodes meet the required scores",
+			"pod", args.Pod.Name)
+		s.recordScheduleFilterResultEvent(args.Pod, EventReasonFilteringFailed, []string{}, fmt.Errorf("no available node, all node scores do not meet"))
 		return &extenderv1.ExtenderFilterResult{
 			FailedNodes: failedNodes,
 		}, nil
 	}
+	klog.V(4).Infoln("nodeScores_len=", len((*nodeScores).NodeList))
 	sort.Sort(nodeScores)
-	m := (*nodeScores)[len(*nodeScores)-1]
-	klog.Infof("schedule %v/%v to %v %v", args.Pod.Namespace, args.Pod.Name, m.nodeID, m.devices)
+	m := (*nodeScores).NodeList[len((*nodeScores).NodeList)-1]
+	klog.InfoS("Scheduling pod to node",
+		"podNamespace", args.Pod.Namespace,
+		"podName", args.Pod.Name,
+		"nodeID", m.NodeID,
+		"devices", m.Devices)
 	annotations := make(map[string]string)
-	annotations[util.AssignedNodeAnnotations] = m.nodeID
+	annotations[util.AssignedNodeAnnotations] = m.NodeID
 	annotations[util.AssignedTimeAnnotations] = strconv.FormatInt(time.Now().Unix(), 10)
-	annotations[util.AssignedIDsAnnotations] = util.EncodePodDevices(m.devices)
-	annotations[util.AssignedIDsToAllocateAnnotations] = annotations[util.AssignedIDsAnnotations]
-	s.addPod(args.Pod, m.nodeID, m.devices)
+
+	for _, val := range device.GetDevices() {
+		val.PatchAnnotations(&annotations, m.Devices)
+	}
+
+	//InRequestDevices := util.EncodePodDevices(util.InRequestDevices, m.devices)
+	//supportDevices := util.EncodePodDevices(util.SupportDevices, m.devices)
+	//maps.Copy(annotations, InRequestDevices)
+	//maps.Copy(annotations, supportDevices)
+	s.addPod(args.Pod, m.NodeID, m.Devices)
 	err = util.PatchPodAnnotations(args.Pod, annotations)
 	if err != nil {
+		s.recordScheduleFilterResultEvent(args.Pod, EventReasonFilteringFailed, []string{}, err)
 		s.delPod(args.Pod)
 		return nil, err
 	}
-	res := extenderv1.ExtenderFilterResult{NodeNames: &[]string{m.nodeID}}
+	s.recordScheduleFilterResultEvent(args.Pod, EventReasonFilteringSucceed, []string{m.NodeID}, nil)
+	res := extenderv1.ExtenderFilterResult{NodeNames: &[]string{m.NodeID}}
 	return &res, nil
 }
