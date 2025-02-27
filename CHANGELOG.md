@@ -214,3 +214,23 @@ Improved log messages
 fix: loss of metrics after vdeivce restart
 
 bugfix: device-plugin monitor serves too slowly in big cluster
+
+## v2.3.9
+
+Add support for iluvatar GPU devices
+
+Fix issue on "get_host_pid" func in HAMi-core
+
+Regular devices API, make it easier to add new devices
+
+## v2.3.10
+
+Fix issue where device-plugin failed to start
+
+## v2.3.11
+
+Add support for Ascend910B device
+
+Add "NVIDIA_VISIBLE_DEVICES=none" to none-gpu tasks
+
+
