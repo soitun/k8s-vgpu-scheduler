@@ -1,3 +1,19 @@
+/*
+Copyright 2024 The HAMi Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 package main
 
 import (
@@ -8,6 +24,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+
 	klog "k8s.io/klog/v2"
 )
 
@@ -25,25 +42,6 @@ import (
 type ClusterManager struct {
 	Zone string
 	// Contains many more fields not listed in this example.
-}
-
-// ReallyExpensiveAssessmentOfTheSystemState is a mock for the data gathering a
-// real cluster manager would have to do. Since it may actually be really
-// expensive, it must only be called once per collection. This implementation,
-// obviously, only returns some made-up data.
-func (c *ClusterManager) ReallyExpensiveAssessmentOfTheSystemState() (
-	oomCountByHost map[string]int, ramUsageByHost map[string]float64,
-) {
-	// Just example fake data.
-	oomCountByHost = map[string]int{
-		"foo.example.org": 42,
-		"bar.example.org": 2001,
-	}
-	ramUsageByHost = map[string]float64{
-		"foo.example.org": 6.023e23,
-		"bar.example.org": 3.14,
-	}
-	return
 }
 
 // ClusterManagerCollector implements the Collector interface.
@@ -64,7 +62,7 @@ func (cc ClusterManagerCollector) Describe(ch chan<- *prometheus.Desc) {
 // Note that Collect could be called concurrently, so we depend on
 // ReallyExpensiveAssessmentOfTheSystemState to be concurrency-safe.
 func (cc ClusterManagerCollector) Collect(ch chan<- prometheus.Metric) {
-	klog.Infof("Starting to collect metrics for scheduler")
+	klog.Info("Starting to collect metrics for scheduler")
 	nodevGPUMemoryLimitDesc := prometheus.NewDesc(
 		"GPUDeviceMemoryLimit",
 		"Device memory limit for a certain GPU",
@@ -101,51 +99,72 @@ func (cc ClusterManagerCollector) Collect(ch chan<- prometheus.Metric) {
 		"GPU Memory Allocated Percentage on a certain GPU",
 		[]string{"nodeid", "deviceuuid", "deviceidx"}, nil,
 	)
+	nodeGPUMigInstance := prometheus.NewDesc(
+		"nodeGPUMigInstance",
+		"GPU Sharing mode. 0 for hami-core, 1 for mig, 2 for mps",
+		[]string{"nodeid", "deviceuuid", "deviceidx", "migname"}, nil,
+	)
 	nu := sher.InspectAllNodesUsage()
 	for nodeID, val := range *nu {
-		for _, devs := range val.Devices {
+		for _, devs := range val.Devices.DeviceLists {
+			if devs.Device.Mode == "mig" {
+				for idx, migs := range devs.Device.MigUsage.UsageList {
+					klog.Infoln("mig instances=", devs.Device.MigUsage)
+					inuse := 0
+					if migs.InUse {
+						inuse = 1
+					}
+					ch <- prometheus.MustNewConstMetric(
+						nodeGPUMigInstance,
+						prometheus.GaugeValue,
+						float64(inuse),
+						nodeID, devs.Device.ID, fmt.Sprint(devs.Device.Index), migs.Name+"-"+fmt.Sprint(idx),
+					)
+				}
+			}
+
 			ch <- prometheus.MustNewConstMetric(
 				nodevGPUMemoryLimitDesc,
 				prometheus.GaugeValue,
-				float64(devs.Totalmem)*float64(1024)*float64(1024),
-				nodeID, devs.Id, fmt.Sprint(devs.Index),
+				float64(devs.Device.Totalmem)*float64(1024)*float64(1024),
+				nodeID, devs.Device.ID, fmt.Sprint(devs.Device.Index),
 			)
 			ch <- prometheus.MustNewConstMetric(
 				nodevGPUCoreLimitDesc,
 				prometheus.GaugeValue,
-				float64(devs.Totalcore),
-				nodeID, devs.Id, fmt.Sprint(devs.Index),
+				float64(devs.Device.Totalcore),
+				nodeID, devs.Device.ID, fmt.Sprint(devs.Device.Index),
 			)
 			ch <- prometheus.MustNewConstMetric(
 				nodevGPUMemoryAllocatedDesc,
 				prometheus.GaugeValue,
-				float64(devs.Usedmem)*float64(1024)*float64(1024),
-				nodeID, devs.Id, fmt.Sprint(devs.Index), fmt.Sprint(devs.Usedcores),
+				float64(devs.Device.Usedmem)*float64(1024)*float64(1024),
+				nodeID, devs.Device.ID, fmt.Sprint(devs.Device.Index), fmt.Sprint(devs.Device.Usedcores),
 			)
 			ch <- prometheus.MustNewConstMetric(
 				nodevGPUSharedNumDesc,
 				prometheus.GaugeValue,
-				float64(devs.Used),
-				nodeID, devs.Id, fmt.Sprint(devs.Index),
+				float64(devs.Device.Used),
+				nodeID, devs.Device.ID, fmt.Sprint(devs.Device.Index),
 			)
 
 			ch <- prometheus.MustNewConstMetric(
 				nodeGPUCoreAllocatedDesc,
 				prometheus.GaugeValue,
-				float64(devs.Usedcores),
-				nodeID, devs.Id, fmt.Sprint(devs.Index),
+				float64(devs.Device.Usedcores),
+				nodeID, devs.Device.ID, fmt.Sprint(devs.Device.Index),
 			)
 			ch <- prometheus.MustNewConstMetric(
 				nodeGPUOverview,
 				prometheus.GaugeValue,
-				float64(devs.Usedmem)*float64(1024)*float64(1024),
-				nodeID, devs.Id, fmt.Sprint(devs.Index), fmt.Sprint(devs.Usedcores), fmt.Sprint(devs.Used), fmt.Sprint(devs.Totalmem), devs.Type,
+				float64(devs.Device.Usedmem)*float64(1024)*float64(1024),
+				nodeID, devs.Device.ID, fmt.Sprint(devs.Device.Index), fmt.Sprint(devs.Device.Usedcores), fmt.Sprint(devs.Device.Used), fmt.Sprint(devs.Device.Totalmem), devs.Device.Type,
 			)
 			ch <- prometheus.MustNewConstMetric(
 				nodeGPUMemoryPercentage,
 				prometheus.GaugeValue,
-				float64(devs.Usedmem)/float64(devs.Totalmem),
-				nodeID, devs.Id, fmt.Sprint(devs.Index),
+				float64(devs.Device.Usedmem)/float64(devs.Device.Totalmem),
+				nodeID, devs.Device.ID, fmt.Sprint(devs.Device.Index),
 			)
 		}
 	}
@@ -167,41 +186,60 @@ func (cc ClusterManagerCollector) Collect(ch chan<- prometheus.Metric) {
 	)
 	schedpods, _ := sher.GetScheduledPods()
 	for _, val := range schedpods {
-		for ctridx, ctrval := range val.Devices {
-			for _, ctrdevval := range ctrval {
-				fmt.Println("Collecting", val.Namespace, val.NodeID, val.Name, ctrdevval.UUID, ctrdevval.Usedcores, ctrdevval.Usedmem)
-				ch <- prometheus.MustNewConstMetric(
-					ctrvGPUDeviceAllocatedDesc,
-					prometheus.GaugeValue,
-					float64(ctrdevval.Usedmem)*float64(1024)*float64(1024),
-					val.Namespace, val.NodeID, val.Name, fmt.Sprint(ctridx), ctrdevval.UUID, fmt.Sprint(ctrdevval.Usedcores))
-				var totaldev int32
-				found := false
-				for _, ni := range *nu {
-					for _, nodedev := range ni.Devices {
-						//fmt.Println("uuid=", nodedev.Id, ctrdevval.UUID)
-						if strings.Compare(nodedev.Id, ctrdevval.UUID) == 0 {
-							totaldev = nodedev.Totalmem
-							found = true
+		for _, podSingleDevice := range val.Devices {
+			for ctridx, ctrdevs := range podSingleDevice {
+				for _, ctrdevval := range ctrdevs {
+					klog.V(4).InfoS("Collecting metrics",
+						"namespace", val.Namespace,
+						"podName", val.Name,
+						"deviceUUID", ctrdevval.UUID,
+						"usedCores", ctrdevval.Usedcores,
+						"usedMem", ctrdevval.Usedmem,
+						"nodeID", val.NodeID,
+					)
+					if len(ctrdevval.UUID) == 0 {
+						klog.Warningf("Device UUID is empty, omitting metric collection for namespace=%s, podName=%s, ctridx=%d, nodeID=%s",
+							val.Namespace, val.Name, ctridx, val.NodeID)
+						continue
+					}
+					ch <- prometheus.MustNewConstMetric(
+						ctrvGPUDeviceAllocatedDesc,
+						prometheus.GaugeValue,
+						float64(ctrdevval.Usedmem)*float64(1024)*float64(1024),
+						val.Namespace, val.NodeID, val.Name, fmt.Sprint(ctridx), ctrdevval.UUID, fmt.Sprint(ctrdevval.Usedcores))
+					var totaldev int32
+					found := false
+					for _, ni := range *nu {
+						for _, nodedev := range ni.Devices.DeviceLists {
+							//fmt.Println("uuid=", nodedev.ID, ctrdevval.UUID)
+							if strings.Compare(nodedev.Device.ID, ctrdevval.UUID) == 0 {
+								totaldev = nodedev.Device.Totalmem
+								found = true
+								break
+							}
+						}
+						if found {
 							break
 						}
 					}
-					if found {
-						break
+					klog.V(4).InfoS("Total memory for device",
+						"deviceUUID", ctrdevval.UUID,
+						"totalMemory", totaldev,
+						"nodeID", val.NodeID,
+					)
+					if totaldev > 0 {
+						ch <- prometheus.MustNewConstMetric(
+							ctrvGPUdeviceAllocatedMemoryPercentageDesc,
+							prometheus.GaugeValue,
+							float64(ctrdevval.Usedmem)/float64(totaldev),
+							val.Namespace, val.NodeID, val.Name, fmt.Sprint(ctridx), ctrdevval.UUID)
 					}
-				}
-				if totaldev > 0 {
 					ch <- prometheus.MustNewConstMetric(
-						ctrvGPUdeviceAllocatedMemoryPercentageDesc,
+						ctrvGPUdeviceAllocateCorePercentageDesc,
 						prometheus.GaugeValue,
-						float64(ctrdevval.Usedmem)/float64(totaldev),
+						float64(ctrdevval.Usedcores),
 						val.Namespace, val.NodeID, val.Name, fmt.Sprint(ctridx), ctrdevval.UUID)
 				}
-				ch <- prometheus.MustNewConstMetric(
-					ctrvGPUdeviceAllocateCorePercentageDesc,
-					prometheus.GaugeValue,
-					float64(ctrdevval.Usedcores),
-					val.Namespace, val.NodeID, val.Name, fmt.Sprint(ctridx), ctrdevval.UUID)
 			}
 		}
 	}
@@ -221,22 +259,15 @@ func NewClusterManager(zone string, reg prometheus.Registerer) *ClusterManager {
 	return c
 }
 
-func initmetrics(bindAddress string) {
+func initMetrics(bindAddress string) {
 	// Since we are dealing with custom Collector implementations, it might
 	// be a good idea to try it out with a pedantic registry.
-	klog.Infof("Initializing metrics for scheduler")
+	klog.Info("Initializing metrics for scheduler")
 	reg := prometheus.NewRegistry()
 
 	// Construct cluster managers. In real code, we would assign them to
 	// variables to then do something with them.
 	NewClusterManager("vGPU", reg)
-	//NewClusterManager("ca", reg)
-
-	// Add the standard process and Go metrics to the custom registry.
-	//reg.MustRegister(
-	//	prometheus.NewProcessCollector(prometheus.ProcessCollectorOpts{}),
-	//	prometheus.NewGoCollector(),
-	//)
 
 	http.Handle("/metrics", promhttp.HandlerFor(reg, promhttp.HandlerOpts{}))
 	log.Fatal(http.ListenAndServe(bindAddress, nil))

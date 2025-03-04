@@ -4,5 +4,11 @@ run_scheduler.sh
 device_plugin.sh
 libvgpu/build
 updateso.sh
+libvgpu.so
 .idea
 vendor
+license
+vgpuvalidator
+_output/
+coverage.out
+.DS_Store
